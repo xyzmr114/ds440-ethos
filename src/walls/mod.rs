@@ -3,6 +3,7 @@ pub mod halluscan;
 pub mod ouroboros;
 pub mod promptinject;
 pub mod redaction;
+pub mod sarif;
 pub mod semantic;
 #[cfg(feature = "semantic-ml")]
 pub mod semantic_neural;

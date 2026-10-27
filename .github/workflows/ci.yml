@@ -4,6 +4,7 @@ on:
   push:
     branches: ["main", "harsh-dev"]
   pull_request:
+  workflow_dispatch:
 
 jobs:
   test:
@@ -23,4 +24,65 @@ jobs:
 
       - name: Run Tests
         run: cargo test --verbose
+
+  sarif:
+    name: Static Analysis (SARIF)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install clippy-sarif & sarif-fmt
+        uses: taiki-e/install-action@v2
+        with:
+          tool: clippy-sarif,sarif-fmt
+
+      # Part A: standard Rust lints (Clippy) -> SARIF
+      - name: Clippy -> SARIF
+        run: |
+          cargo clippy --all-targets --message-format=json \
+            | clippy-sarif | tee clippy.sarif | sarif-fmt
+        continue-on-error: true
+
+      # Part B: Ethos's own prompt-injection scanner -> SARIF.
+      # Benchmark data, red-team tests, reports and the scanner's own pattern
+      # source contain attack strings on purpose, so they are excluded.
+      - name: Ethos injection scan -> SARIF
+        run: |
+          cargo run --quiet --bin ethos -- scan . --output ethos.sarif \
+                           --exclude data --exclude tests --exclude reports --exclude src/walls --exclude docs --exclude scripts
+
+      - name: Archive SARIF reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sarif-reports
+          path: "*.sarif"
+
+      # PRs from forks get a read-only token, so only upload for pushes
+      # and PRs opened inside the same repository.
+      - name: Upload Clippy SARIF
+        if: always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: clippy.sarif
+          category: clippy
+
+      - name: Upload Ethos SARIF
+        if: always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: ethos.sarif
+          category: ethos-promptinject
 

@@ -82,6 +82,21 @@ pub enum Commands {
     Doctor,
     /// Launch the interactive terminal UI (Ratatui Cyber Dark Dashboard)
     Tui,
+    /// Scan a directory for prompt-injection content and write a SARIF 2.1.0 report
+    Scan {
+        /// Directory to scan
+        #[arg(default_value = ".")]
+        dir: PathBuf,
+        /// SARIF output path
+        #[arg(short, long, default_value = "ethos.sarif")]
+        output: PathBuf,
+        /// Path (relative to DIR) to skip; repeatable
+        #[arg(short, long)]
+        exclude: Vec<PathBuf>,
+        /// Exit non-zero at/above this severity: none, low, medium, high
+        #[arg(long, default_value = "none")]
+        fail_on: String,
+    },
 }
 
 pub async fn run_cli() -> anyhow::Result<()> {
@@ -113,7 +128,57 @@ pub async fn run_cli() -> anyhow::Result<()> {
         } => run_eval_suite(&dataset, &provider, &model, &split, output, synthetic).await,
         Commands::Doctor => run_doctor().await,
         Commands::Tui => run_tui_command().await,
+        Commands::Scan {
+            dir,
+            output,
+            exclude,
+            fail_on,
+        } => run_scan(&dir, &output, &exclude, &fail_on),
     }
+}
+
+fn run_scan(
+    dir: &std::path::Path,
+    output: &std::path::Path,
+    exclude: &[PathBuf],
+    fail_on: &str,
+) -> anyhow::Result<()> {
+    use crate::walls::promptinject::Severity;
+    use crate::walls::sarif;
+
+    let threshold = match fail_on.to_ascii_lowercase().as_str() {
+        "none" => None,
+        "low" => Some(Severity::Low),
+        "medium" => Some(Severity::Medium),
+        "high" => Some(Severity::High),
+        other => anyhow::bail!("--fail-on must be none, low, medium or high (got '{}')", other),
+    };
+
+    let scanner = PromptInjectScanner::new();
+    let hits = sarif::scan_directory(&scanner, dir, exclude)?;
+    let log = sarif::to_sarif(&scanner, &hits);
+    std::fs::write(output, serde_json::to_string_pretty(&log)?)?;
+
+    let count = |s: Severity| hits.iter().filter(|h| h.finding.severity == s).count();
+    println!(
+        "[ethos scan] {} finding(s) (high: {}, medium: {}, low: {}) -> {}",
+        hits.len(),
+        count(Severity::High),
+        count(Severity::Medium),
+        count(Severity::Low),
+        output.display()
+    );
+    // Location + rule only; never the matched text (RT-13).
+    for h in &hits {
+        println!("  {}:{}  {} [{}]", h.path, h.line, h.finding.pattern_name, h.finding.category);
+    }
+
+    if let Some(t) = threshold {
+        if hits.iter().any(|h| h.finding.severity >= t) {
+            anyhow::bail!("findings at or above '{}' severity", fail_on);
+        }
+    }
+    Ok(())
 }
 
 async fn run_interactive(dir: Option<PathBuf>) -> anyhow::Result<()> {

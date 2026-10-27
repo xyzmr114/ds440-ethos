@@ -128,6 +128,43 @@ impl PromptInjectScanner {
             .collect::<Vec<_>>()
             .join(", ")
     }
+    
+    /// Rule catalogue `(pattern_name, category, severity)` for every active
+    /// pattern. Used by the SARIF exporter to describe the tool's rules.
+    pub fn rules(&self) -> Vec<(&'static str, &'static str, Severity)> {
+        self.patterns
+            .iter()
+            .map(|p| (p.name, p.category, p.severity))
+            .collect()
+    }
+
+    /// Like `scan`, but reports every match with its 1-indexed line number.
+    /// Folding only drops zero-width chars, never newlines, so line numbers
+    /// computed on the folded text match the original file.
+    pub fn scan_located(&self, text: &str) -> Vec<(usize, Finding)> {
+        let folded = fold_lookalikes(text);
+        let line_starts: Vec<usize> = std::iter::once(0)
+            .chain(folded.match_indices('\n').map(|(i, _)| i + 1))
+            .collect();
+        let line_of = |offset: usize| line_starts.partition_point(|&s| s <= offset);
+
+        let mut out = Vec::new();
+        for p in &self.patterns {
+            for mat in p.regex.find_iter(&folded) {
+                out.push((
+                    line_of(mat.start()),
+                    Finding {
+                        category: p.category.to_string(),
+                        severity: p.severity,
+                        pattern_name: p.name.to_string(),
+                        match_excerpt: mat.as_str().to_string(),
+                    },
+                ));
+            }
+        }
+        out.sort_by_key(|(line, _)| *line);
+        out
+    }
 }
 
 /// Folds Unicode confusables to their ASCII lookalikes and strips
