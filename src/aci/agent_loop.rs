@@ -44,12 +44,23 @@ pub enum AgentStopReason {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StepTrace {
+    pub step: usize,
+    pub tool: String,
+    pub arguments: serde_json::Value,
+    pub verdict: String,
+    pub blocked: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentRunResult {
     pub stop_reason: AgentStopReason,
     pub total_steps: usize,
     pub final_summary: String,
     pub history: Vec<AgentMessage>,
     pub taint_violations: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub traces: Vec<StepTrace>,
 }
 
 pub trait LlmDriver: Send + Sync {
@@ -181,6 +192,7 @@ impl AgentLoop {
 
         let mut total_steps = 0;
         let mut taint_violations = 0;
+        let mut traces: Vec<StepTrace> = Vec::new();
 
         while total_steps < self.max_steps {
             total_steps += 1;
@@ -193,12 +205,20 @@ impl AgentLoop {
                         content: summary.clone(),
                         tool_name: None,
                     });
+                    traces.push(StepTrace {
+                        step: total_steps,
+                        tool: "finish".to_string(),
+                        arguments: serde_json::Value::Null,
+                        verdict: "COMPLETED".to_string(),
+                        blocked: false,
+                    });
                     return Ok(AgentRunResult {
                         stop_reason: AgentStopReason::Completed,
                         total_steps,
                         final_summary: summary,
                         history,
                         taint_violations,
+                        traces,
                     });
                 }
                 AgentStepAction::CallTool { name, arguments } => {
@@ -283,14 +303,21 @@ impl AgentLoop {
                         });
                     }
 
-                    if tool_result.status == "BLOCKED_BY_POLICY"
+                    let blocked = tool_result.status == "BLOCKED_BY_POLICY"
                         || tool_result
                             .policy_decision
                             .as_ref()
-                            .is_some_and(|p| !p.allowed)
-                    {
+                            .is_some_and(|p| !p.allowed);
+                    if blocked {
                         taint_violations += 1;
                     }
+                    traces.push(StepTrace {
+                        step: total_steps,
+                        tool: name.clone(),
+                        arguments: arguments.clone(),
+                        verdict: tool_result.status.clone(),
+                        blocked,
+                    });
 
                     let output_str = serde_json::to_string(&tool_result).unwrap_or_default();
                     history.push(AgentMessage {
@@ -308,6 +335,7 @@ impl AgentLoop {
             final_summary: format!("Step limit of {} exceeded", self.max_steps),
             history,
             taint_violations,
+            traces,
         })
     }
 }

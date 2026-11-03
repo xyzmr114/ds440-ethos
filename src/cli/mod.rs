@@ -71,6 +71,15 @@ pub enum Commands {
         /// 70/20/10 Dataset partition: 'train' (70%), 'eval' (20%), 'test' (10% blind holdout), or 'all'
         #[arg(long, default_value = "all")]
         split: String,
+        /// Permit silent substitution of the deterministic driver when the
+        /// inference endpoint is unreachable. Off by default so that a dead
+        /// endpoint fails the run instead of producing a report that looks
+        /// like a model result.
+        #[arg(long, default_value_t = false)]
+        allow_fallback: bool,
+        /// Override the per-scenario step budget (default: value in the case file)
+        #[arg(long)]
+        max_steps: Option<usize>,
         /// Optional path to export JSON/Markdown report
         #[arg(short, long)]
         output: Option<String>,
@@ -125,7 +134,21 @@ pub async fn run_cli() -> anyhow::Result<()> {
             split,
             output,
             synthetic,
-        } => run_eval_suite(&dataset, &provider, &model, &split, output, synthetic).await,
+            allow_fallback,
+            max_steps: max_steps_override,
+        } => {
+            run_eval_suite(
+                &dataset,
+                &provider,
+                &model,
+                &split,
+                output,
+                synthetic,
+                allow_fallback,
+                max_steps_override,
+            )
+            .await
+        }
         Commands::Doctor => run_doctor().await,
         Commands::Tui => run_tui_command().await,
         Commands::Scan {
@@ -317,6 +340,9 @@ pub struct CliHttpDriver {
     pub client: reqwest::Client,
     pub api_url: String,
     pub model: String,
+    /// When false, a transport failure is returned as an error instead of
+    /// being converted into a successful "harness verified" completion.
+    pub allow_fallback: bool,
 }
 
 impl LlmDriver for CliHttpDriver {
@@ -461,8 +487,16 @@ impl LlmDriver for CliHttpDriver {
                 })
             }
             Err(e) => {
+                if !self.allow_fallback {
+                    anyhow::bail!(
+                        "inference endpoint {} unreachable and --allow-fallback was not set: {}. \
+                         Refusing to substitute a scripted completion for a model response.",
+                        self.api_url,
+                        e
+                    );
+                }
                 println!(
-                    "    [Notice] LLM endpoint at {} offline ({}). Running harness self-diagnostic task.",
+                    "    [Notice] LLM endpoint at {} offline ({}). Falling back to harness self-diagnostic task (--allow-fallback is set).",
                     self.api_url, e
                 );
                 Ok(AgentStepAction::Finish {
@@ -500,6 +534,7 @@ async fn run_harness_task(
         client: reqwest::Client::new(),
         api_url: api_url.to_string(),
         model: model.to_string(),
+        allow_fallback: true,
     };
 
     let mut agent_loop = AgentLoop::new(max_steps);
@@ -523,6 +558,8 @@ async fn run_eval_suite(
     split: &str,
     output_file: Option<String>,
     synthetic: bool,
+    allow_fallback: bool,
+    max_steps_override: Option<usize>,
 ) -> anyhow::Result<()> {
     println!("============================================================");
     println!("  ETHOS INJECTION BENCHMARK & DEFENSE EVALUATION SUITE");
@@ -777,6 +814,7 @@ async fn run_eval_suite(
         }
     }
 
+    let mut probed_model: Option<String> = None;
     let (driver, is_live): (Box<dyn LlmDriver>, bool) = if provider == "lmstudio" {
         let test_client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_millis(1500))
@@ -827,17 +865,25 @@ async fn run_eval_suite(
         if let Some((endpoint, active_model)) = live_info {
             println!("  [+] Connected to live LM Studio server at {}", endpoint);
             println!("      Streaming live inference against model: {}\n", active_model);
+            probed_model = Some(active_model.clone());
             (
                 Box::new(CliHttpDriver {
                     client: reqwest::Client::new(),
                     api_url: endpoint,
                     model: active_model,
+                    allow_fallback,
                 }),
                 true,
             )
         } else {
             println!("  [!] Notice: LM Studio is offline (probed ports 2277, 1234).");
-            println!("      Running evaluation suite with deterministic baseline driver.\n");
+            if !allow_fallback {
+                anyhow::bail!(
+                    "no inference server was reachable for provider 'lmstudio' and --allow-fallback \
+                     was not set. Refusing to write a report that a scripted driver produced."
+                );
+            }
+            println!("      --allow-fallback is set: running with the deterministic baseline driver.\n");
             (Box::new(DeterministicEvalDriver), false)
         }
     } else if provider == "ollama" {
@@ -858,23 +904,44 @@ async fn run_eval_suite(
                     client: reqwest::Client::new(),
                     api_url: "http://localhost:11434/v1".to_string(),
                     model: model.to_string(),
+                    allow_fallback,
                 }),
                 true,
             )
         } else {
             println!("  [!] Notice: Ollama is offline at http://localhost:11434.");
-            println!("      Running evaluation suite with deterministic baseline driver.\n");
+            if !allow_fallback {
+                anyhow::bail!(
+                    "no inference server was reachable for provider 'ollama' and --allow-fallback \
+                     was not set. Refusing to write a report that a scripted driver produced."
+                );
+            }
+            println!("      --allow-fallback is set: running with the deterministic baseline driver.\n");
             (Box::new(DeterministicEvalDriver), false)
         }
     } else {
         (Box::new(DeterministicEvalDriver), false)
     };
 
+    if let Some(n) = max_steps_override {
+        for scenario in scenarios.iter_mut() {
+            scenario.max_steps = n;
+        }
+        println!("  Step budget override applied to every scenario: {}\n", n);
+    }
+    let effective_max_steps = max_steps_override.or_else(|| scenarios.iter().map(|s| s.max_steps).max());
+
     let runner = BenchmarkRunner::new();
     let mut report = runner.run_suite(&scenarios, &*driver).await?;
+    // `model` records what was requested. `active_model` records what actually
+    // answered, which is what the probe selected and what a reader needs in
+    // order to attribute a result.
     report.provider = Some(provider.to_string());
     report.model = Some(model.to_string());
     report.split = Some(split.to_string());
+    report.driver = Some(if is_live { "live".to_string() } else { "deterministic".to_string() });
+    report.active_model = probed_model.clone();
+    report.max_steps = effective_max_steps;
 
 
     println!("------------------------------------------------------------");

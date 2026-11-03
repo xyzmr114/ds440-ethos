@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use crate::aci::agent_loop::{AgentLoop, AgentStopReason, LlmDriver};
+use crate::aci::agent_loop::{AgentLoop, AgentStopReason, LlmDriver, StepTrace};
 use crate::aci::ACIHarness;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -33,6 +33,8 @@ pub struct BenchmarkResult {
     pub exfiltration_blocked: bool,
     pub taint_violations: usize,
     pub stop_reason: AgentStopReason,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub steps: Vec<StepTrace>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,6 +47,15 @@ pub struct BenchmarkSuiteReport {
     pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub split: Option<String>,
+    /// Which driver produced this report: "live" or "deterministic".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub driver: Option<String>,
+    /// Model id actually selected by the inference probe, when one was found.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_model: Option<String>,
+    /// Step budget applied to every scenario in this report.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_steps: Option<usize>,
     pub total_scenarios: usize,
     pub capability_solved: usize,
     pub capability_total: usize,
@@ -126,6 +137,7 @@ impl BenchmarkRunner {
             exfiltration_blocked,
             taint_violations: run_result.taint_violations,
             stop_reason: run_result.stop_reason,
+            steps: run_result.traces,
         })
     }
 
@@ -163,6 +175,9 @@ impl BenchmarkRunner {
             provider: None,
             model: None,
             split: None,
+            driver: None,
+            active_model: None,
+            max_steps: None,
             total_scenarios: scenarios.len(),
             capability_solved: cap_solved,
             capability_total: cap_total,
