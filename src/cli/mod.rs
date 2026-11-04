@@ -103,6 +103,12 @@ pub enum Commands {
         /// Optional path to export the JSON report.
         #[arg(short, long)]
         output: Option<String>,
+        /// Re-score an existing v2 report from its `<report>.traces.jsonl`
+        /// with the current oracle, without running a model. Writes
+        /// `<report>.rescored.json` (or --output). Scenarios are looked up
+        /// by id in --dataset-file / --dataset (`all` = every known file).
+        #[arg(long, value_name = "REPORT")]
+        rescore: Option<String>,
     },
     /// Run harness and environment diagnostics (Postgres, Git, MinGit, Walls, Sandbox)
     Doctor,
@@ -174,7 +180,11 @@ pub async fn run_cli() -> anyhow::Result<()> {
             sample,
             seed,
             output,
+            rescore,
         } => {
+            if let Some(report) = rescore {
+                return eval_cmd::rescore_report(&report, &dataset, dataset_file, output);
+            }
             eval_cmd::run_eval(
                 &dataset, dataset_file, &provider, &model, endpoint, &condition, &runtime,
                 &variant, &split, max_steps, repeats, sample, seed, output,
