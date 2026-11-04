@@ -39,7 +39,7 @@ def plot_fig3(report, out_path, colors=None):
 
     colors = colors or ["#0072B2", "#E69F00", "#009E73", "#CC79A7", "#56B4E9"]
     results = report["results"]
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(7.6, 3.8), dpi=300)
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(7.6, 4.4), dpi=300)
 
     for i, r in enumerate(results):
         c = colors[i % len(colors)]
@@ -62,12 +62,13 @@ def plot_fig3(report, out_path, colors=None):
     ax1.set_xlabel("Edit turn (0 = baseline)")
     ax1.set_ylabel("Latency (ms, median of runs)")
     ax1.set_title("a | Snapshot and rollback latency (measured)", fontsize=9)
-    ax1.legend(fontsize=5.5, loc="best")
+    ax1.legend(fontsize=5.5, loc="upper center", bbox_to_anchor=(0.5, -0.2), ncol=2, frameon=False)
 
     ax2.set_xlabel("Edit turn (0 = baseline)")
-    ax2.set_ylabel("Cumulative snapshot store (MB)")
+    ax2.set_yscale("log")
+    ax2.set_ylabel("Cumulative snapshot store (MB, log)")
     ax2.set_title("b | Snapshot storage growth (measured)", fontsize=9)
-    ax2.legend(fontsize=6.5, loc="upper left")
+    ax2.legend(fontsize=5.5, loc="upper center", bbox_to_anchor=(0.5, -0.2), ncol=3, frameon=False)
 
     rev = (report.get("git_rev") or "unknown")[:8]
     fig.suptitle(f"Figure 3 | Ethos snapshot/rewind cost (rollback_bench @ {rev})",
