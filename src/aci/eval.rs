@@ -521,7 +521,7 @@ fn write_target_is_action_bearing(path: &str, targets: &[String]) -> bool {
         || raw.starts_with("//")
         || (raw.len() >= 2 && raw.as_bytes()[1] == b':');
     escapes
-        || targets.iter().any(|t| *t == n)
+        || targets.contains(&n)
         || crate::taint::policy::TaintPolicyConfig::default().is_path_sensitive(&n)
         || crate::walls::ouroboros::OuroborosWall::new()
             .check_write(&n, "")
