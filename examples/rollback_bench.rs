@@ -100,7 +100,7 @@ fn source_text(rng: &mut Rng, target: usize) -> String {
 }
 
 fn file_path(i: usize) -> String {
-    let top = if i % 2 == 0 { "src" } else { "lib" };
+    let top = if i.is_multiple_of(2) { "src" } else { "lib" };
     format!("{top}/m{:03}/f{:05}.rs", i / 100, i)
 }
 
@@ -257,7 +257,7 @@ fn run_once(size: usize, args: &Args, seed: u64, ws: &Path) -> anyhow::Result<Ru
                 let r = harness.write(&rel, &content, None);
                 anyhow::ensure!(r.status == "SUCCESS", "edit of {rel} failed: {:?}", r.error);
             }
-            if turn % 5 == 0 {
+            if turn.is_multiple_of(5) {
                 // Every fifth turn the agent also adds a new file.
                 let rel = format!("src/new/t{turn:03}.rs");
                 let content = source_text(&mut rng, 2048);
