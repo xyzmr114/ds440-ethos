@@ -511,6 +511,217 @@ pub async fn run_eval(
     Ok(())
 }
 
+/// Default output of `--rescore`: `x.json` -> `x.rescored.json`.
+pub fn rescored_path(report: &str) -> String {
+    match report.strip_suffix(".json") {
+        Some(stem) => format!("{}.rescored.json", stem),
+        None => format!("{}.rescored.json", report),
+    }
+}
+
+/// `ethos eval --rescore reports/x.json`: re-applies the current oracle to
+/// a saved v2 report using its `<report>.traces.jsonl` sidecar, without
+/// running a model. Scenario definitions are looked up by id in
+/// `dataset_file`, or the named `dataset` (`all` = every known file).
+/// Workspace predicates (`file_*`) and utility verdicts cannot be
+/// recomputed from a trace and are carried over; the report records which.
+pub fn rescore_report(
+    report_path: &str,
+    dataset: &str,
+    dataset_file: Option<String>,
+    output: Option<String>,
+) -> anyhow::Result<()> {
+    use std::collections::{BTreeMap, HashMap};
+
+    let out_dest = output.unwrap_or_else(|| rescored_path(report_path));
+    if std::path::Path::new(&out_dest) == std::path::Path::new(report_path) {
+        anyhow::bail!("--output must differ from the report being rescored");
+    }
+    let mut report: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(report_path)
+            .map_err(|e| anyhow::anyhow!("reading {}: {}", report_path, e))?,
+    )?;
+    if report.get("schema_version").and_then(|v| v.as_u64()) != Some(2) {
+        anyhow::bail!("{} is not a v2 report (schema_version != 2)", report_path);
+    }
+    let traces_path = format!("{}.traces.jsonl", report_path);
+    let traces: Vec<serde_json::Value> = std::fs::read_to_string(&traces_path)
+        .map_err(|e| anyhow::anyhow!("reading {}: {} (rescoring needs the trace sidecar)", traces_path, e))?
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(serde_json::from_str)
+        .collect::<Result<_, _>>()?;
+
+    // Scenario definitions by id.
+    let files: Vec<PathBuf> = match &dataset_file {
+        Some(f) => vec![PathBuf::from(f)],
+        None if dataset == "all" => [
+            "injecagent", "hackaprompt", "agenthijack", "m365", "evasion", "modern", "benign",
+            "capability", "injected", "fetch", "tool_output", "injecagent-upstream",
+        ]
+        .iter()
+        .flat_map(|n| dataset_files(n))
+        .collect(),
+        None => dataset_files(dataset),
+    };
+    if files.is_empty() {
+        anyhow::bail!("no scenario files found; run from the repo root or pass --dataset-file");
+    }
+    let mut scenarios: HashMap<String, Scenario> = HashMap::new();
+    for f in &files {
+        for s in eval::load_file(f)? {
+            if scenarios.contains_key(&s.id) {
+                eprintln!("  [!] duplicate scenario id '{}' in {} (keeping the first)", s.id, f.display());
+                continue;
+            }
+            scenarios.insert(s.id.clone(), s);
+        }
+    }
+
+    let key = |v: &serde_json::Value| {
+        (
+            v.get("scenario_id").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+            v.get("trial").and_then(|x| x.as_u64()).unwrap_or(0),
+            v.get("variant").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        )
+    };
+    let original_summary = report.get("summary").cloned();
+    let results = report
+        .get_mut("results")
+        .and_then(|r| r.as_array_mut())
+        .ok_or_else(|| anyhow::anyhow!("report has no results array"))?;
+
+    let mut used = vec![false; traces.len()];
+    let mut changed: Vec<serde_json::Value> = Vec::new();
+    let mut carried: BTreeMap<String, usize> = BTreeMap::new();
+    let mut missing: BTreeMap<String, usize> = BTreeMap::new();
+    let mut drift: BTreeMap<String, usize> = BTreeMap::new();
+    let (mut rescored, mut skipped_invalid, mut no_scenario, mut no_trace) = (0, 0, 0, 0);
+
+    for (i, r) in results.iter_mut().enumerate() {
+        if !r.get("valid").and_then(|v| v.as_bool()).unwrap_or(false) {
+            skipped_invalid += 1;
+            continue;
+        }
+        let k = key(r);
+        // Traces are written in result order; fall back to key lookup.
+        let ti = if traces.get(i).map(|t| key(t) == k).unwrap_or(false) && !used[i] {
+            Some(i)
+        } else {
+            (0..traces.len()).find(|&j| !used[j] && key(&traces[j]) == k)
+        };
+        let Some(ti) = ti else {
+            no_trace += 1;
+            continue;
+        };
+        used[ti] = true;
+        let Some(scenario) = scenarios.get(&k.0) else {
+            no_scenario += 1;
+            continue;
+        };
+        let steps: Vec<crate::aci::agent_loop::StepTrace> =
+            serde_json::from_value(traces[ti].get("steps").cloned().unwrap_or_default())?;
+        let original_hits: Vec<eval::OracleHit> =
+            serde_json::from_value(r.get("oracle_hits").cloned().unwrap_or_default()).unwrap_or_default();
+
+        let new = eval::rescore_trace(scenario, &steps, &original_hits);
+        rescored += 1;
+        for l in &new.carried_over {
+            *carried.entry(l.split('(').next().unwrap_or(l).to_string()).or_default() += 1;
+        }
+        for l in &new.missing {
+            *missing.entry(l.clone()).or_default() += 1;
+        }
+        // Recomputed predicates other than args_contains should agree with
+        // the original run; count any that do not (oracle/canary drift).
+        for h in &new.oracle_hits {
+            if h.predicate.starts_with("args_contains(") {
+                continue;
+            }
+            if let Some(o) = original_hits.iter().find(|o| o.predicate == h.predicate) {
+                if o != h {
+                    *drift.entry(h.predicate.clone()).or_default() += 1;
+                }
+            }
+        }
+
+        let b = |k: &str| r.get(k).and_then(|v| v.as_bool()).unwrap_or(false);
+        let before = (b("attack_attempted"), b("attack_succeeded"), b("attack_blocked"));
+        let after = (new.attack_attempted, new.attack_succeeded, new.attack_blocked);
+        if before != after || original_hits != new.oracle_hits {
+            changed.push(serde_json::json!({
+                "scenario_id": k.0, "trial": k.1, "variant": k.2,
+                "before": { "attempted": before.0, "succeeded": before.1, "blocked": before.2 },
+                "after": { "attempted": after.0, "succeeded": after.1, "blocked": after.2 },
+            }));
+            r["original"] = serde_json::json!({
+                "attack_attempted": before.0,
+                "attack_succeeded": before.1,
+                "attack_blocked": before.2,
+                "oracle_hits": original_hits,
+            });
+            r["attack_attempted"] = after.0.into();
+            r["attack_succeeded"] = after.1.into();
+            r["attack_blocked"] = after.2.into();
+            r["oracle_hits"] = serde_json::to_value(&new.oracle_hits)?;
+        }
+    }
+
+    let summary = eval::summarise_json(results);
+    report["summary"] = serde_json::to_value(&summary)?;
+    if let Some(s) = original_summary {
+        report["original_summary"] = s;
+    }
+    report["rescore"] = serde_json::json!({
+        "source_report": report_path,
+        "source_traces": traces_path,
+        "oracle_rule": "args_contains-action-bearing-v1",
+        "rescored_at": chrono::Utc::now().to_rfc3339(),
+        "rescored_git_rev": eval::git_rev(),
+        "rescored_ethos_version": env!("CARGO_PKG_VERSION"),
+        "runs_rescored": rescored,
+        "runs_invalid_skipped": skipped_invalid,
+        "runs_without_trace": no_trace,
+        "runs_without_scenario": no_scenario,
+        "carried_over_predicates": carried,
+        "missing_predicates": missing,
+        "recomputed_predicate_drift": drift,
+        "changed_runs": changed,
+        "notes": "Trace-only predicates (egress, canary_leak by canary prefix, sensitive_read, command, args_contains) were recomputed. file_written/file_modified/file_deleted need the final workspace, which traces do not keep; their original verdicts are carried over. payload_read, utility_ok and false_positive are unchanged.",
+    });
+
+    std::fs::write(&out_dest, serde_json::to_string_pretty(&report)?)?;
+    println!("[+] Rescored {} run(s) from {}", rescored, traces_path);
+    if skipped_invalid + no_trace + no_scenario > 0 {
+        println!(
+            "    skipped: {} invalid, {} without a trace line, {} with no scenario definition",
+            skipped_invalid, no_trace, no_scenario
+        );
+    }
+    if !carried.is_empty() {
+        println!("    carried over (need final workspace): {:?}", carried);
+    }
+    if !drift.is_empty() {
+        println!("    [!] recomputed predicates disagreeing with the original: {:?}", drift);
+    }
+    for c in &changed {
+        println!(
+            "    changed: {} trial {} ({}): succeeded {} -> {}, attempted {} -> {}",
+            c["scenario_id"].as_str().unwrap_or(""),
+            c["trial"],
+            c["variant"].as_str().unwrap_or(""),
+            c["before"]["succeeded"],
+            c["after"]["succeeded"],
+            c["before"]["attempted"],
+            c["after"]["attempted"]
+        );
+    }
+    let invalid = report.get("invalid_runs").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    print_summary(&summary, invalid);
+    println!("[+] Rescored report written to {}", out_dest);
+    Ok(())
+}
+
 fn pct(n: usize, d: usize) -> String {
     if d == 0 {
         "n/a".to_string()
