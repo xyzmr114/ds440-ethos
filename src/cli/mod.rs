@@ -108,20 +108,33 @@ pub enum Commands {
     Doctor,
     /// Launch the interactive terminal UI (Ratatui Cyber Dark Dashboard)
     Tui,
-    /// Scan a directory for prompt-injection content and write a SARIF 2.1.0 report
+    /// Scan a directory for prompt-injection content and write a SARIF 2.1.0 or JSON report
     Scan {
         /// Directory to scan
         #[arg(default_value = ".")]
         dir: PathBuf,
-        /// SARIF output path
-        #[arg(short, long, default_value = "ethos.sarif")]
-        output: PathBuf,
+        /// Report format: 'sarif' (GitHub Code Scanning, VS Code) or 'json' (flat, scriptable)
+        #[arg(short, long, value_enum, default_value_t = ScanFormat::Sarif)]
+        format: ScanFormat,
+        /// Output path (default: ethos.sarif for sarif, ethos-scan.json for json)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
         /// Path (relative to DIR) to skip; repeatable
         #[arg(short, long)]
         exclude: Vec<PathBuf>,
         /// Exit non-zero at/above this severity: none, low, medium, high
         #[arg(long, default_value = "none")]
         fail_on: String,
+        /// Include the matched source line safely: 'none' (default), 'hash'
+        /// (keyed fingerprint only) or 'encrypt' (fingerprint + AES-256-GCM
+        /// ciphertext). hash/encrypt read the secret from ETHOS_SCAN_KEY.
+        #[arg(long, value_enum, default_value_t = ExcerptArg::None)]
+        excerpt: ExcerptArg,
+    },
+    /// Decrypt the excerpts in a report made with `scan --excerpt encrypt` (needs ETHOS_SCAN_KEY)
+    Reveal {
+        /// SARIF or JSON report produced by `ethos scan --excerpt encrypt`
+        report: PathBuf,
     },
     /// Score the PromptInjectScanner (and optionally SemanticGuard) on a labelled JSONL corpus
     ScannerEval {
@@ -185,10 +198,16 @@ pub async fn run_cli() -> anyhow::Result<()> {
         Commands::Tui => run_tui_command().await,
         Commands::Scan {
             dir,
+            format,
             output,
             exclude,
             fail_on,
-        } => run_scan(&dir, &output, &exclude, &fail_on),
+            excerpt,
+        } => {
+            let output = output.unwrap_or_else(|| PathBuf::from(format.default_output()));
+            run_scan(&dir, format, &output, &exclude, &fail_on, excerpt)
+        }
+        Commands::Reveal { report } => run_reveal(&report),
         Commands::ScannerEval {
             data,
             semantic,
@@ -198,11 +217,46 @@ pub async fn run_cli() -> anyhow::Result<()> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum ScanFormat {
+    Sarif,
+    Json,
+}
+
+impl ScanFormat {
+    pub fn default_output(self) -> &'static str {
+        match self {
+            ScanFormat::Sarif => "ethos.sarif",
+            ScanFormat::Json => "ethos-scan.json",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum ExcerptArg {
+    None,
+    Hash,
+    Encrypt,
+}
+
+impl From<ExcerptArg> for crate::walls::sarif::ExcerptMode {
+    fn from(a: ExcerptArg) -> Self {
+        use crate::walls::sarif::ExcerptMode;
+        match a {
+            ExcerptArg::None => ExcerptMode::None,
+            ExcerptArg::Hash => ExcerptMode::Hash,
+            ExcerptArg::Encrypt => ExcerptMode::Encrypt,
+        }
+    }
+}
+
 fn run_scan(
     dir: &std::path::Path,
+    format: ScanFormat,
     output: &std::path::Path,
     exclude: &[PathBuf],
     fail_on: &str,
+    excerpt: ExcerptArg,
 ) -> anyhow::Result<()> {
     use crate::walls::promptinject::Severity;
     use crate::walls::sarif;
@@ -215,10 +269,25 @@ fn run_scan(
         other => anyhow::bail!("--fail-on must be none, low, medium or high (got '{}')", other),
     };
 
+    // Check the key BEFORE scanning, so a missing secret fails fast and no
+    // report is ever written without the protection that was asked for.
+    let mode: sarif::ExcerptMode = excerpt.into();
+    let protector = match mode {
+        sarif::ExcerptMode::None => None,
+        _ => Some(sarif::ExcerptProtector::from_env()?),
+    };
+
     let scanner = PromptInjectScanner::new();
     let hits = sarif::scan_directory(&scanner, dir, exclude)?;
-    let log = sarif::to_sarif(&scanner, &hits);
-    std::fs::write(output, serde_json::to_string_pretty(&log)?)?;
+    let mut report = match format {
+        ScanFormat::Sarif => sarif::to_sarif(&scanner, &hits),
+        ScanFormat::Json => sarif::to_json(&hits),
+    };
+    if let Some(p) = &protector {
+        let lines = sarif::source_lines(dir, &hits);
+        sarif::add_excerpts(&mut report, mode, p, &lines);
+    }
+    std::fs::write(output, serde_json::to_string_pretty(&report)?)?;
 
     let count = |s: Severity| hits.iter().filter(|h| h.finding.severity == s).count();
     println!(
@@ -238,6 +307,45 @@ fn run_scan(
         if hits.iter().any(|h| h.finding.severity >= t) {
             anyhow::bail!("findings at or above '{}' severity", fail_on);
         }
+    }
+    Ok(())
+}
+
+fn run_reveal(report: &std::path::Path) -> anyhow::Result<()> {
+    use crate::walls::sarif;
+
+    let protector = sarif::ExcerptProtector::from_env()?;
+    let doc: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(report)?)?;
+    let excerpts = sarif::reveal_excerpts(&doc, &protector)?;
+
+    if excerpts.is_empty() {
+        println!("[ethos reveal] no encrypted excerpts in {} (was it made with --excerpt encrypt?)", report.display());
+        return Ok(());
+    }
+    println!("[ethos reveal] {} excerpt(s) from {}", excerpts.len(), report.display());
+    println!("WARNING: the text below is untrusted attacker content. Do not paste it into an AI tool.");
+    println!("Control and invisible characters are shown as \\u{{..}}.");
+    // Path and rule id come from the report, and the path is an
+    // attacker-chosen file name, so they are escaped exactly like the text.
+    let esc = sarif::escape_for_terminal;
+    let mut failed = 0;
+    for e in &excerpts {
+        println!("  {}:{}  [{}]", esc(&e.path), e.line, esc(&e.rule_id));
+        match &e.text {
+            Ok(text) => println!("    {}", esc(text)),
+            Err(err) => {
+                failed += 1;
+                println!("    [could not decrypt: {}]", err);
+            }
+        }
+    }
+    if failed > 0 {
+        anyhow::bail!(
+            "{} of {} excerpt(s) could not be decrypted (wrong {} or tampered report)",
+            failed,
+            excerpts.len(),
+            sarif::EXCERPT_KEY_ENV
+        );
     }
     Ok(())
 }
@@ -416,4 +524,3 @@ async fn run_harness_task(
 
     Ok(())
 }
-
